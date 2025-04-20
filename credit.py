@@ -27,8 +27,12 @@ init()
 
 console = Console()
 
-CONFIG_FILE = os.path.expanduser("~/.credit.conf")
-VERSION = "2.1.0"
+if platform.system() == "Windows":
+    CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".credit.conf")
+else:
+    CONFIG_FILE = os.path.expanduser("~/.credit.conf")
+
+VERSION = "2.2.7"
 
 CURRENT_YEAR = datetime.now().year
 AQUA = "#00FFFF"
@@ -518,6 +522,64 @@ def preview_changes(files, force_update=False):
     console.print(table)
 
 
+def update_system_path_permanently(path_to_add):
+    """Update the system PATH environment variable permanently."""
+    if platform.system() == "Windows":
+        try:
+            import winreg
+
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_READ
+            )
+            try:
+                path, _ = winreg.QueryValueEx(key, "PATH")
+                paths = path.split(";")
+                if path_to_add in paths:
+                    winreg.CloseKey(key)
+                    return True, "Path already exists in PATH"
+            except WindowsError:
+                path = ""
+            winreg.CloseKey(key)
+
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_WRITE
+            )
+            if path:
+                new_path = f"{path};{path_to_add}"
+            else:
+                new_path = path_to_add
+
+            winreg.SetValueEx(key, "PATH", 0, winreg.REG_EXPAND_SZ, new_path)
+            winreg.CloseKey(key)
+
+            try:
+                import ctypes
+
+                HWND_BROADCAST = 0xFFFF
+                WM_SETTINGCHANGE = 0x001A
+                SMTO_ABORTIFHUNG = 0x0002
+                result = ctypes.c_long()
+                SendMessageTimeoutW = ctypes.windll.user32.SendMessageTimeoutW
+                SendMessageTimeoutW(
+                    HWND_BROADCAST,
+                    WM_SETTINGCHANGE,
+                    0,
+                    ctypes.c_wchar_p("Environment"),
+                    SMTO_ABORTIFHUNG,
+                    5000,
+                    ctypes.byref(result),
+                )
+            except Exception:
+                pass  # It's okay if this fails
+
+            return True, "Successfully added to PATH"
+        except Exception as e:
+            return False, str(e)
+    else:
+        # For Unix-like systems, this is typically done by adding to .bashrc, .zshrc, etc.
+        return False, "Not implemented for this platform"
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="credit",
@@ -734,35 +796,36 @@ def install_script():
     script_path = os.path.abspath(__file__)
 
     if platform.system() == "Windows":
-        batch_path = os.path.join(os.path.expanduser("~"), "credit.bat")
+        user_bin_dir = os.path.join(os.path.expanduser("~"), "bin")
+        os.makedirs(user_bin_dir, exist_ok=True)
+
+        script_dest = os.path.join(user_bin_dir, "credit.py")
+        batch_path = os.path.join(user_bin_dir, "credit.bat")
+
+        shutil.copy2(script_path, script_dest)
+
         with open(batch_path, "w") as f:
-            f.write(f'@echo off\npython "{script_path}" %*')
+            f.write(f'@echo off\npython "{script_dest}" %*')
 
-        # Add to PATH
-        import winreg
+        success, message = update_system_path_permanently(user_bin_dir)
 
-        try:
-            key = winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_ALL_ACCESS
-            )
-            path, _ = winreg.QueryValueEx(key, "PATH")
-            user_dir = os.path.dirname(batch_path)
-            if user_dir not in path:
-                new_path = path + ";" + user_dir
-                winreg.SetValueEx(key, "PATH", 0, winreg.REG_EXPAND_SZ, new_path)
-                winreg.CloseKey(key)
-                console.print(
-                    "[green]Successfully added to PATH. Please restart your command prompt.[/green]"
-                )
-            else:
-                console.print("[green]Already in PATH.[/green]")
-        except Exception as e:
-            console.print(f"[red]Error adding to PATH: {str(e)}[/red]")
-            console.print(f"[yellow]Script installed at {batch_path}[/yellow]")
+        if success:
+            console.print(f"[green]Script installed at {script_dest}[/green]")
+            console.print(f"[green]Batch file created at {batch_path}[/green]")
+            console.print(f"[green]{message}[/green]")
             console.print(
-                "[yellow]You may need to add this directory to your PATH manually.[/yellow]"
+                "[yellow]You may need to restart your command prompt for the changes to take effect.[/yellow]"
             )
+        else:
+            console.print(f"[red]Error adding to PATH: {message}[/red]")
+            console.print(f"[yellow]Script installed at {script_dest}[/yellow]")
+            console.print(f"[yellow]Batch file created at {batch_path}[/yellow]")
+            console.print(
+                "[yellow]To use from any directory, add this directory to your PATH manually:[/yellow]"
+            )
+            console.print(f"[blue]{user_bin_dir}[/blue]")
     else:
+        # For Unix-like systems
         dest_path = "/usr/local/bin/credit"
         try:
             shutil.copy(script_path, dest_path)
@@ -775,6 +838,25 @@ def install_script():
             )
         except Exception as e:
             console.print(f"[red]Error installing: {str(e)}[/red]")
+
+            user_bin = os.path.expanduser("~/bin")
+            os.makedirs(user_bin, exist_ok=True)
+            user_dest = os.path.join(user_bin, "credit")
+
+            try:
+                shutil.copy(script_path, user_dest)
+                os.chmod(user_dest, 0o755)
+                console.print(f"[green]Successfully installed at {user_dest}[/green]")
+
+                if user_bin not in os.environ.get("PATH", "").split(":"):
+                    console.print(
+                        "[yellow]Add this line to your .bashrc or .zshrc file:[/yellow]"
+                    )
+                    console.print(f'[blue]export PATH="$PATH:{user_bin}"[/blue]')
+            except Exception as e2:
+                console.print(
+                    f"[red]Error installing to user directory: {str(e2)}[/red]"
+                )
 
 
 if __name__ == "__main__":
