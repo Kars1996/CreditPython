@@ -2,6 +2,7 @@
 import os
 import re
 import sys
+import time
 import argparse
 from datetime import datetime
 from colorama import init
@@ -20,8 +21,7 @@ from rich import box
 import shutil
 import configparser
 import platform
-
-# ! Do `pip install rich` if you don't have it already :3
+import statistics
 
 init()
 
@@ -32,7 +32,7 @@ if platform.system() == "Windows":
 else:
     CONFIG_FILE = os.path.expanduser("~/.credit.conf")
 
-VERSION = "2.2.7"
+VERSION = "2.3.0"
 
 CURRENT_YEAR = datetime.now().year
 AQUA = "#00FFFF"
@@ -63,6 +63,9 @@ config = get_config()
 USERNAME = config["username"]
 GITHUB = config["github"]
 DEFAULT_DIRECTORY = config["directory"]
+
+# Debug metrics storage
+FILE_PROCESSING_TIMES = {}
 
 SUPPORTED_EXTENSIONS = {
     "javascript": [".js", ".jsx"],
@@ -209,10 +212,114 @@ def check_existing_copyright(content, language):
     return False, None, None
 
 
+def detect_import_blocks(content, language):
+    """
+    Detect complete import blocks, handling multi-line imports.
+    Returns the position after the last import statement.
+    """
+    if language in ["javascript", "typescript"]:
+        import_patterns = [
+            # Standard imports: import X from 'Y'
+            r'import\s+[\w\s{},*]+\s+from\s+[\'"].*?[\'"];?',
+            # Dynamic imports: import('X')
+            r'import\s*\([\'"].*?[\'"]\)',
+            # Require: const X = require('Y')
+            r'(?:const|let|var)\s+[\w\s{}]+\s*=\s*require\s*\([\'"].*?[\'"]\);?',
+            # Import type: import type { X } from 'Y'
+            r'import\s+type\s+[\w\s{},*]+\s+from\s+[\'"].*?[\'"];?',
+        ]
+        
+        combined_pattern = '|'.join(f'({p})' for p in import_patterns)
+        
+        all_imports = list(re.finditer(combined_pattern, content, re.DOTALL | re.MULTILINE))
+        
+        if not all_imports:
+            return 0
+        
+        imports_to_check = []
+        
+        for import_match in all_imports:
+            start_pos = import_match.start()
+            end_pos = import_match.end()
+            
+            # Check if this import is inside a comment block or string
+            in_comment = False
+            for pattern in [r'/\*.*?\*/', r'//.*?(?:\n|$)', r'".*?"', r"'.*?'"]:
+                comment_matches = list(re.finditer(pattern, content, re.DOTALL))
+                for comment_match in comment_matches:
+                    comment_start = comment_match.start()
+                    comment_end = comment_match.end()
+                    if comment_start <= start_pos and end_pos <= comment_end:
+                        in_comment = True
+                        break
+                if in_comment:
+                    break
+            
+            if not in_comment:
+                imports_to_check.append((start_pos, end_pos))
+        
+        # If we have valid imports, find the last one
+        if imports_to_check:
+            # Sort by end position to find the last one
+            imports_to_check.sort(key=lambda x: x[1])
+            _, last_import_end = imports_to_check[-1]
+            
+            match = re.search(r'\S', content[last_import_end:])
+            if match:
+                return last_import_end + match.start()
+            else:
+                return last_import_end
+        
+        return 0
+    
+    elif language == "python":
+        import_patterns = [
+            r'^import\s+.*?$',  # import x
+            r'^from\s+.*?\s+import\s+.*?$',  # from x import y
+        ]
+        
+        combined_pattern = '|'.join(import_patterns)
+        all_imports = list(re.finditer(combined_pattern, content, re.MULTILINE))
+        
+        if not all_imports:
+            return 0
+            
+        all_imports.sort(key=lambda x: x.end())
+        last_import_end = all_imports[-1].end()
+        
+        newline_count = 0
+        index = last_import_end
+        
+        while index < len(content):
+            if content[index].isspace():
+                if content[index] == '\n':
+                    newline_count += 1
+                    if newline_count > 1:  # Two consecutive newlines end the import block
+                        break
+                index += 1
+            else:
+                break
+        
+        return index
+    
+    # Default fallback for other languages
+    else:
+        imports_pattern = r'^import.*?$|^.*?from.*?import.*?$'
+        matches = list(re.finditer(imports_pattern, content, re.MULTILINE))
+        
+        if matches:
+            last_import_end = matches[-1].end()
+            return last_import_end
+        
+        return 0
+
+
 def add_or_update_copyright(
     file_path, force_update=False, custom_username=None, custom_github=None
 ):
     """Add or update copyright notice in a file."""
+    start_time = time.time()
+    
     try:
         with open(file_path, "r", encoding="utf-8") as file:
             content = file.read()
@@ -226,6 +333,7 @@ def add_or_update_copyright(
         return "error", str(e)
 
     if should_ignore_file(content):
+        FILE_PROCESSING_TIMES[file_path] = time.time() - start_time
         return "ignored", None
 
     _, extension = os.path.splitext(file_path)
@@ -237,6 +345,7 @@ def add_or_update_copyright(
     has_copyright, year, old_notice = check_existing_copyright(content, language)
 
     if has_copyright and year == str(CURRENT_YEAR) and not force_update:
+        FILE_PROCESSING_TIMES[file_path] = time.time() - start_time
         return "skipped", None
 
     copyright_notice = get_copyright_template(language).format(
@@ -249,6 +358,7 @@ def add_or_update_copyright(
         with open(file_path, "w", encoding="utf-8") as file:
             file.write(modified_content)
 
+        FILE_PROCESSING_TIMES[file_path] = time.time() - start_time
         return "updated", year
 
     if language == "python" and content.startswith("#!"):
@@ -261,17 +371,15 @@ def add_or_update_copyright(
             + content[shebang_end:]
         )
     else:
-        imports_pattern = r"^import.*?$|^.*?from.*?import.*?$"
-        matches = list(re.finditer(imports_pattern, content, re.MULTILINE))
+        imports_end = detect_import_blocks(content, language)
 
-        if matches:
-            last_import_end = matches[-1].end()
+        if imports_end > 0:
             modified_content = (
-                content[:last_import_end]
+                content[:imports_end]
                 + "\n\n"
                 + copyright_notice
                 + "\n\n"
-                + content[last_import_end:].lstrip()
+                + content[imports_end:].lstrip()
             )
         else:
             modified_content = copyright_notice + "\n\n" + content
@@ -279,6 +387,7 @@ def add_or_update_copyright(
     with open(file_path, "w", encoding="utf-8") as file:
         file.write(modified_content)
 
+    FILE_PROCESSING_TIMES[file_path] = time.time() - start_time
     return "added", None
 
 
@@ -320,6 +429,50 @@ def print_stats(stats):
 
     console.print("\n")
     console.print(table)
+
+
+def print_debug_stats():
+    """Print debug statistics about file processing times."""
+    if not FILE_PROCESSING_TIMES:
+        console.print("[yellow]No timing data available.[/yellow]")
+        return
+    
+    times = list(FILE_PROCESSING_TIMES.values())
+    total_time = sum(times)
+    avg_time = total_time / len(times)
+    
+    longest_file = max(FILE_PROCESSING_TIMES.items(), key=lambda x: x[1])
+    
+    table = Table(title="Processing Time Statistics", border_style=AQUA)
+    
+    table.add_column("Metric", style="dim")
+    table.add_column("Value", style="bold")
+    
+    table.add_row("Total processing time", f"{total_time:.4f} seconds")
+    table.add_row("Average time per file", f"{avg_time:.4f} seconds")
+    table.add_row("Median time", f"{statistics.median(times):.4f} seconds")
+    if len(times) > 1:
+        table.add_row("Standard deviation", f"{statistics.stdev(times):.4f} seconds")
+    table.add_row("Minimum time", f"{min(times):.4f} seconds")
+    table.add_row("Maximum time", f"{max(times):.4f} seconds")
+    table.add_row("Longest file", os.path.relpath(longest_file[0]))
+    table.add_row("Longest file time", f"{longest_file[1]:.4f} seconds")
+    
+    console.print("\n")
+    console.print(table)
+    
+    if len(FILE_PROCESSING_TIMES) > 5:
+        top_files = sorted(FILE_PROCESSING_TIMES.items(), key=lambda x: x[1], reverse=True)[:5]
+        
+        detail_table = Table(title="Top 5 Longest Processing Files", border_style=AQUA)
+        detail_table.add_column("File", style="dim")
+        detail_table.add_column("Time (seconds)", style="bold")
+        
+        for file_path, proc_time in top_files:
+            detail_table.add_row(os.path.relpath(file_path), f"{proc_time:.4f}")
+        
+        console.print("\n")
+        console.print(detail_table)
 
 
 def create_config(username, github, directory):
@@ -391,6 +544,9 @@ def print_help():
     examples_table.add_row(
         "credit --setup", "Configure your username and GitHub handle"
     )
+    examples_table.add_row(
+        "credit --debug", "Show timing statistics after processing"
+    )
 
     console.print(
         Panel(
@@ -422,6 +578,7 @@ def print_help():
     options_table.add_row("--version", "Show version information")
     options_table.add_row("--detailed-help", "Show this detailed help message")
     options_table.add_row("--install", "Install as system command")
+    options_table.add_row("--debug", "Show processing time statistics")
 
     console.print(
         Panel(
@@ -649,6 +806,9 @@ Use 'credit --detailed-help' to see complete documentation.
     parser.add_argument(
         "--github", help="Override GitHub handle for this run", default=None
     )
+    parser.add_argument(
+        "--debug", help="Show processing time statistics", action="store_true"
+    )
 
     args = parser.parse_args()
 
@@ -789,6 +949,8 @@ Use 'credit --detailed-help' to see complete documentation.
             progress.update(task, advance=1)
 
     print_stats(stats)
+    if args.debug:
+        print_debug_stats()
 
 
 def install_script():
